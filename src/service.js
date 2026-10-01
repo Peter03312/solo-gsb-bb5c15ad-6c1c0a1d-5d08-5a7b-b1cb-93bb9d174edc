@@ -50,16 +50,25 @@ async function getPlan(client, planId) {
   return rows[0];
 }
 
-/** 取该展品占用额度的计划（已批准、待复核）。excludePlanId 用于把待批计划自身排除。 */
-async function getOccupyingPlans(client, exhibitId, excludePlanId = null) {
+/**
+ * 取该展品占用额度的计划（已批准、待复核）。
+ * excludePlanIds 用于把成对核对中的两条计划一并排除：可传单 id、id 数组或 null。
+ */
+async function getOccupyingPlans(client, exhibitId, excludePlanIds = null) {
+  const ids = excludePlanIds === null || excludePlanIds === undefined
+    ? []
+    : (Array.isArray(excludePlanIds) ? excludePlanIds : [excludePlanIds])
+        .filter((id) => id !== null && id !== undefined);
   // 状态为模块内固定白名单，直接内联到 SQL（避免不同驱动对 ANY($) 数组绑定的差异）
   const statusList = ACTIVE_PLAN_STATUSES.map((s) => `'${s}'`).join(',');
+  const placeholders = ['$1', ...ids.map((_, i) => `$${i + 2}`)];
+  const notIn = ids.length === 0 ? '' : `AND id NOT IN (${placeholders.slice(1).join(',')})`;
   const { rows } = await client.query(
     `SELECT * FROM plans
-      WHERE exhibit_id = $1 AND status IN (${statusList})
-        AND ($2::bigint IS NULL OR id <> $2)
+      WHERE exhibit_id = ${placeholders[0]} AND status IN (${statusList})
+        ${notIn}
       ORDER BY id`,
-    [exhibitId, excludePlanId]
+    [exhibitId, ...ids]
   );
   return rows;
 }
@@ -124,8 +133,11 @@ async function findOverlappingMeasurement(client, exhibitId, startMs, endMs, exc
  * 同一计划窗口先被该展品全部已确认实测（通常即本计划的实测）扣除，再按其照度估算，
  * 因此实测确认后该时段自动以实测替代估算。
  */
-async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null } = {}) {
-  const plans = await getOccupyingPlans(client, exhibitId, excludePlanId);
+async function computeOccupancy(client, exhibitId, { excludePlanId = null, excludePlanIds = null, extraMeasurement = null } = {}) {
+  const excludes = excludePlanIds !== null
+    ? (Array.isArray(excludePlanIds) ? excludePlanIds : [excludePlanIds])
+    : (excludePlanId !== null ? [excludePlanId] : []);
+  const plans = await getOccupyingPlans(client, exhibitId, excludes);
   const measurements = await getActiveMeasurements(client, exhibitId);
   const limitRows = await client.query(
     'SELECT year, limit_lxh FROM annual_limits WHERE exhibit_id = $1',
@@ -394,6 +406,76 @@ function adjustmentWindows(adj) {
   );
 }
 
+/** 取某计划全部未作废（draft/confirmed）实测。 */
+async function getNonAnnulledMeasurements(client, planId) {
+  const { rows } = await client.query(
+    `SELECT id, start_ts, end_ts, status, actual_lux
+       FROM measurements
+      WHERE plan_id = $1 AND status <> 'annulled'
+      ORDER BY id`,
+    [planId]
+  );
+  return rows;
+}
+
+/** 实测行 -> 毫秒区间数组（可只取已确认）。 */
+function measurementIntervals(measRows, { confirmedOnly = false } = {}) {
+  return measRows
+    .filter((m) => !confirmedOnly || m.status === 'confirmed')
+    .map((m) => ({ start: new Date(m.start_ts).getTime(), end: new Date(m.end_ts).getTime() }));
+}
+
+/**
+ * 窗口在扣除与其相交的已确认实测区间后的估算残余（按自然年）。
+ * 与 computeOccupancy 口径一致：只扣除落在窗口内（相交）的实测覆盖部分。
+ */
+function residueYearlyFromWindows(windows, confirmedIntervals, lux) {
+  const coverers = confirmedIntervals.filter((mw) => windows.some((w) => intersects(w, mw)));
+  const remaining = subtractIntervals(windows, coverers);
+  return yearMapToObject(doseByYear(remaining, Number(lux)));
+}
+
+/** 列出未被目标开窗完整包含的未作废实测（含 draft）。 */
+function outsideMeasurementsReport(measRows, targetWindows) {
+  const outside = [];
+  for (const m of measRows) {
+    const seg = {
+      start: new Date(m.start_ts).getTime(),
+      end: new Date(m.end_ts).getTime(),
+    };
+    if (!targetWindows.some((w) => containsInterval(w, seg))) {
+      outside.push({
+        id: m.id,
+        status: m.status,
+        lux: Number(m.actual_lux),
+        start: tsToWallString(seg.start),
+        end: tsToWallString(seg.end),
+      });
+    }
+  }
+  return outside;
+}
+
+/** 计划原值摘要（错误信息与审计共用）。 */
+function planOriginalValues(plan) {
+  return {
+    startDate: String(plan.start_date).slice(0, 10),
+    endDate: String(plan.end_date).slice(0, 10),
+    periods: normalizePeriods(plan.light_periods),
+    estimatedLux: Number(plan.estimated_lux),
+  };
+}
+
+/** 调整申请拟改值摘要。 */
+function adjustmentProposedValues(adj) {
+  return {
+    startDate: dateYmd(adj.start_date),
+    endDate: dateYmd(adj.end_date),
+    periods: normalizePeriods(adj.light_periods),
+    estimatedLux: Number(adj.estimated_lux),
+  };
+}
+
 /**
  * 调整申请试算（事务内、已持有展品行锁后调用）：
  * 保管员批准时重新核对的全部规则：
@@ -419,28 +501,8 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
   };
 
   // 1) 未作废实测必须完整落在某个新开灯窗内（仅核对本计划的实测）
-  const { rows: measRows } = await client.query(
-    `SELECT id, start_ts, end_ts, status, actual_lux
-       FROM measurements
-      WHERE plan_id = $1 AND status <> 'annulled'
-      ORDER BY id`,
-    [plan.id]
-  );
-  for (const m of measRows) {
-    const seg = {
-      start: new Date(m.start_ts).getTime(),
-      end: new Date(m.end_ts).getTime(),
-    };
-    if (!targetWindows.some((w) => containsInterval(w, seg))) {
-      conflicts.outsideMeasurements.push({
-        id: m.id,
-        status: m.status,
-        lux: Number(m.actual_lux),
-        start: tsToWallString(seg.start),
-        end: tsToWallString(seg.end),
-      });
-    }
-  }
+  const measRows = await getNonAnnulledMeasurements(client, plan.id);
+  conflicts.outsideMeasurements = outsideMeasurementsReport(measRows, targetWindows);
 
   // 2) 与同展品其他已批准/待复核计划的开灯时刻重叠
   const others = await getOccupyingPlans(client, plan.exhibit_id, plan.id);
@@ -458,29 +520,27 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
 
   // 3) 按自然年替换估算残余后的额度核算
   // 本计划已确认实测覆盖的区间（draft 不计量、仍由估算占位）
-  const confirmedMeas = measRows.filter((m) => m.status === 'confirmed');
-  const coverers = confirmedMeas
-    .map((m) => ({ start: new Date(m.start_ts).getTime(), end: new Date(m.end_ts).getTime() }))
-    .filter((mw) => targetWindows.some((w) => intersects(w, mw)));
-  const newRemaining = subtractIntervals(targetWindows, coverers);
-  const newResidueYearly = yearMapToObject(doseByYear(newRemaining, Number(adjInput.estimated_lux)));
+  const newResidueYearly = residueYearlyFromWindows(
+    targetWindows,
+    measurementIntervals(measRows, { confirmedOnly: true }),
+    Number(adjInput.estimated_lux)
+  );
 
   const occupancy = await computeOccupancy(client, plan.exhibit_id, { excludePlanId: plan.id });
   const limits = occupancy.limits;
   const occupiedWithoutPlan = occupancy.used;
 
-  // 原残余按年（与 computeOccupancy 对本计划的口径一致）
+  // 原残余按年（与 computeOccupancy 对本计划的口径一致：扣除该展品全部与其相交的已确认实测）
   const oldWindows = planWindows(plan);
   const allConfirmed = await getActiveMeasurements(client, plan.exhibit_id);
-  const allMeasWindows = allConfirmed.map((m) => ({
-    start: new Date(m.start_ts).getTime(),
-    end: new Date(m.end_ts).getTime(),
-  }));
-  const oldRemaining = subtractIntervals(
+  const oldResidue = residueYearlyFromWindows(
     oldWindows,
-    allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw)))
+    allConfirmed.map((m) => ({
+      start: new Date(m.start_ts).getTime(),
+      end: new Date(m.end_ts).getTime(),
+    })),
+    Number(plan.estimated_lux)
   );
-  const oldResidue = yearMapToObject(doseByYear(oldRemaining, Number(plan.estimated_lux)));
 
   // 4) 合并每个相关年份：上限、不含本计划的占用、原残余、新残余、合计、超额
   const yearsSet = new Set([
@@ -534,6 +594,194 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
     occupiedWithoutPlan,
     yearlyReport,
   };
+}
+
+/**
+ * 成对调整核对（事务内、已持有展品行锁后调用）：
+ * 保管员把同一展品两份待审调整申请成对核准（用于两条已批准且未开始计划互换/协同挪动档期）。
+ *
+ * 调用方须保证：两份申请存在、分属不同计划、同属展品 exhibitId（结构性校验在路由层）。
+ * 本函数在锁内重新核对全部业务规则：
+ *   1) 两条计划仍已批准且尚未开始
+ *   2) 各计划所有未作废（draft/confirmed）实测都落在各自新开灯窗内
+ *   3) 两份拟改新开灯窗彼此不得重叠；且都不与同展品“其他”已批准/待复核计划重叠
+ *   4) 按自然年：同时以两条新窗口各自“未被已确认实测覆盖部分”的估算量替换各自旧残余，
+ *      任一年超过年度上限即超额（未登记上限的年份也算冲突）
+ *
+ * 返回 {
+ *   ok, entries: [{ plan, adjustment, windows, conflicts:{notApproved,notStarted,outsideMeasurements},
+ *                   oldResidueYearly, newResidueYearly, original, proposed }],
+ *   conflicts: { pairOverlaps, overlappingPlans, overflows, missingLimits },
+ *   occupiedWithoutPlans, yearlyReport
+ * }
+ */
+async function evaluatePairAdjustment(client, exhibitId, adjA, adjB, nowMs = Date.now()) {
+  const planA = await getPlan(client, adjA.plan_id);
+  const planB = await getPlan(client, adjB.plan_id);
+  const ordered = [
+    { plan: planA, adjustment: adjA },
+    { plan: planB, adjustment: adjB },
+  ].sort((x, y) => x.plan.id - y.plan.id);
+
+  const globalConflicts = {
+    pairOverlaps: [],
+    overlappingPlans: [],
+    overflows: [],
+    missingLimits: [],
+  };
+
+  const entries = [];
+  for (const item of ordered) {
+    const { plan, adjustment } = item;
+    const targetWindows = adjustmentWindows(adjustment);
+    const ownConflicts = {
+      notApproved: plan.status !== 'approved',
+      notStarted: !planNotStarted(plan, nowMs),
+      outsideMeasurements: [],
+    };
+
+    // 1) 未作废实测必须完整落在各自新开灯窗内（仅核对本计划的实测）
+    const measRows = await getNonAnnulledMeasurements(client, plan.id);
+    ownConflicts.outsideMeasurements = outsideMeasurementsReport(measRows, targetWindows);
+
+    // 2) 新窗口未被已确认实测覆盖部分的估算残余（draft 不计量）
+    const newResidueYearly = residueYearlyFromWindows(
+      targetWindows,
+      measurementIntervals(measRows, { confirmedOnly: true }),
+      Number(adjustment.estimated_lux)
+    );
+
+    // 原残余按年（与 computeOccupancy 口径一致）
+    const oldResidueYearly = residueYearlyFromWindows(
+      planWindows(plan),
+      await getPlanConfirmedIntervals(client, plan.id),
+      Number(plan.estimated_lux)
+    );
+
+    entries.push({
+      plan,
+      adjustment,
+      windows: targetWindows,
+      conflicts: ownConflicts,
+      oldResidueYearly,
+      newResidueYearly,
+      original: planOriginalValues(plan),
+      proposed: adjustmentProposedValues(adjustment),
+    });
+  }
+
+  const [entry0, entry1] = entries;
+
+  // 3) 两份拟改窗口彼此不得重叠
+  if (anyIntersect(entry0.windows, entry1.windows)) {
+    globalConflicts.pairOverlaps.push({
+      planIds: [entry0.plan.id, entry1.plan.id],
+      adjustmentIds: [entry0.adjustment.id, entry1.adjustment.id],
+      titles: [entry0.plan.title, entry1.plan.title],
+    });
+  }
+
+  // 4) 与同展品“其他”已批准/待复核计划（不含这两条）的开灯时刻重叠
+  const others = await getOccupyingPlans(client, exhibitId, entries.map((e) => e.plan.id));
+  for (const other of others) {
+    for (const entry of entries) {
+      if (planOverlaps(entry.windows, other)) {
+        globalConflicts.overlappingPlans.push({
+          planId: entry.plan.id,
+          adjustmentId: entry.adjustment.id,
+          planTitle: entry.plan.title,
+          otherId: other.id,
+          otherTitle: other.title,
+          otherStatus: other.status,
+          otherStartDate: dateYmd(other.start_date),
+          otherEndDate: dateYmd(other.end_date),
+        });
+      }
+    }
+  }
+
+  // 5) 按自然年同时替换两条估算残余后的额度核算
+  const occupancy = await computeOccupancy(client, exhibitId, {
+    excludePlanIds: entries.map((e) => e.plan.id),
+  });
+  const limits = occupancy.limits;
+  const occupiedWithoutPlans = occupancy.used;
+
+  const yearsSet = new Set([
+    ...Object.keys(limits),
+    ...Object.keys(occupiedWithoutPlans),
+    ...entries.flatMap((e) => Object.keys(e.oldResidueYearly)),
+    ...entries.flatMap((e) => Object.keys(e.newResidueYearly)),
+  ].map(Number));
+  const yearlyReport = {};
+  for (const year of [...yearsSet].sort((a, b) => a - b)) {
+    const key = String(year);
+    const limit = limits[key] !== undefined && limits[key] !== null ? round3(limits[key]) : null;
+    const otherUsed = round3(occupiedWithoutPlans[key] || 0);
+    const old0 = round3(entry0.oldResidueYearly[key] || 0);
+    const old1 = round3(entry1.oldResidueYearly[key] || 0);
+    const new0 = round3(entry0.newResidueYearly[key] || 0);
+    const new1 = round3(entry1.newResidueYearly[key] || 0);
+    const oldTotal = round3(old0 + old1);
+    const newTotal = round3(new0 + new1);
+    const projected = round3(otherUsed + new0 + new1);
+    const row = {
+      year,
+      limit,
+      usedByOthers: otherUsed,
+      oldResidues: {
+        [entry0.plan.id]: old0,
+        [entry1.plan.id]: old1,
+      },
+      newResidues: {
+        [entry0.plan.id]: new0,
+        [entry1.plan.id]: new1,
+      },
+      oldResidueTotal: oldTotal,
+      newResidueTotal: newTotal,
+      projected,
+      remainingAfter: limit === null ? null : round3(limit - projected),
+      excess: null,
+    };
+    if (limit === null) {
+      // 任一新残余占用了该年却没登记上限 -> 冲突
+      if (new0 > 0 || new1 > 0) globalConflicts.missingLimits.push(Number(year));
+    } else if (projected - limit > 0.005) {
+      row.excess = round3(projected - limit);
+      globalConflicts.overflows.push(row);
+    }
+    yearlyReport[key] = row;
+  }
+
+  const ok =
+    entries.every((e) => !e.conflicts.notApproved && !e.conflicts.notStarted &&
+      e.conflicts.outsideMeasurements.length === 0) &&
+    globalConflicts.pairOverlaps.length === 0 &&
+    globalConflicts.overlappingPlans.length === 0 &&
+    globalConflicts.overflows.length === 0 &&
+    globalConflicts.missingLimits.length === 0;
+
+  return {
+    ok,
+    entries,
+    conflicts: globalConflicts,
+    occupiedWithoutPlans,
+    yearlyReport,
+  };
+}
+
+/** 某计划落在其窗口内的已确认实测区间（成对核算的旧残余口径：本计划自身的已确认实测）。 */
+async function getPlanConfirmedIntervals(client, planId) {
+  const { rows } = await client.query(
+    `SELECT start_ts, end_ts FROM measurements
+      WHERE plan_id = $1 AND status = 'confirmed'
+      ORDER BY id`,
+    [planId]
+  );
+  return rows.map((m) => ({
+    start: new Date(m.start_ts).getTime(),
+    end: new Date(m.end_ts).getTime(),
+  }));
 }
 
 /**
@@ -752,6 +1000,9 @@ module.exports = {
   planNotStarted,
   adjustmentWindows,
   evaluateAdjustment,
+  evaluatePairAdjustment,
+  planOriginalValues,
+  adjustmentProposedValues,
   decoratePlans,
   serializeAdjustment,
 };

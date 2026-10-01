@@ -223,7 +223,176 @@ function renderDetail() {
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
   $$('.adj-action').forEach((btn) => btn.addEventListener('click', () => adjustmentAction(btn)));
   $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
+  renderPairAdjustBox();
 }
+
+/**
+ * 成对核准面板：从本展品计划的待审调整申请中收集可选项。
+ * 保管员可选择两份不同申请成对试算/核准。
+ */
+function pendingAdjustmentOptions() {
+  const out = [];
+  for (const p of state.detail.plans || []) {
+    const a = p.pendingAdjustment;
+    if (a && a.status === 'pending') {
+      out.push({
+        adjustmentId: a.id,
+        planId: p.id,
+        planTitle: p.title,
+        label: `申请 #${a.id} · 计划 #${p.id}「${p.title}」`,
+      });
+    }
+  }
+  return out.sort((x, y) => x.adjustmentId - y.adjustmentId);
+}
+
+function renderPairAdjustBox() {
+  const box = $('#pair-adjust-box');
+  if (state.user.role !== 'conservator') { box.classList.add('hidden'); return; }
+  const opts = pendingAdjustmentOptions();
+  box.classList.toggle('hidden', opts.length < 2);
+  if (opts.length < 2) { $('#pair-result').innerHTML = ''; return; }
+  // 保留当前选择（仍有效时）
+  const prevA = $('#pair-adj-a').value;
+  const prevB = $('#pair-adj-b').value;
+  const buildOptions = (selected) =>
+    '<option value="">— 选择待审调整申请 —</option>' +
+    opts.map((o) =>
+      `<option value="${o.adjustmentId}"${String(o.adjustmentId) === String(selected) ? ' selected' : ''}>${esc(o.label)}</option>`
+    ).join('');
+  $('#pair-adj-a').innerHTML = buildOptions(prevA);
+  $('#pair-adj-b').innerHTML = buildOptions(prevB && prevB !== prevA ? prevB : '');
+  // 两下拉互斥：在另一框中已选的申请在本框禁用
+  syncPairSelects();
+}
+
+const syncPairSelects = () => {
+  const a = $('#pair-adj-a');
+  const b = $('#pair-adj-b');
+  const refresh = (sel, otherVal) => {
+    Array.from(sel.options).forEach((op) => {
+      if (op.value && op.value === otherVal) op.disabled = true;
+      else op.disabled = false;
+    });
+  };
+  refresh(a, b.value);
+  refresh(b, a.value);
+};
+
+/** 取成对面板当前选择的两个申请编号；非法时抛错（中文提示）。 */
+function readPairSelection() {
+  const a = Number($('#pair-adj-a').value);
+  const b = Number($('#pair-adj-b').value);
+  if (!a || !b) throw new Error('请先选择两份不同的待审调整申请');
+  if (a === b) throw new Error('两份申请必须不同');
+  return [a, b];
+}
+
+/** 成对试算/核对结果的明细 HTML（每份申请一条 + 年度核算表）。 */
+function pairPreviewHtml(pv) {
+  const entryItems = (conflictsForEntry) => {
+    const items = [];
+    if (conflictsForEntry.notApproved) items.push('计划已不是「已批准」状态');
+    if (conflictsForEntry.notStarted) items.push('计划已经开始');
+    (conflictsForEntry.outsideMeasurements || []).forEach((m) =>
+      items.push(`未作废实测 #${m.id}（${esc(m.start)} ~ ${esc(m.end)}，${STATUS_TEXT[m.status] || m.status}）不在新开灯窗内`));
+    return items;
+  };
+  const cards = (pv.adjustments || []).map((e) => {
+    const orig = e.original || {};
+    const next = e.proposed || {};
+    const diff = scheduleDiff(
+      { startDate: orig.startDate, endDate: orig.endDate, periods: orig.periods, estimatedLux: orig.estimatedLux },
+      { startDate: next.startDate, endDate: next.endDate, periods: next.periods, estimatedLux: next.estimatedLux }
+    );
+    const own = entryItems(e.conflicts || {});
+    return `<div class="adj-box">
+      <div class="adj-head">${badge('pending')}申请 #${e.adjustmentId} · 计划 #${e.planId}「${esc(e.planTitle)}」${badge(e.status)}</div>
+      ${diff}
+      <div class="source-doses">原残余：${yearlyText(e.oldResidueYearly)}</div>
+      <div class="source-doses">拟改残余：${yearlyText(e.newResidueYearly)}</div>
+      ${own.length ? `<div class="adj-conflict"><ul>${own.map((x) => `<li>${x}</li>`).join('')}</ul></div>` : ''}
+    </div>`;
+  }).join('');
+
+  const c = pv.conflicts || {};
+  const globalItems = [];
+  (c.pairOverlaps || []).forEach((p) =>
+    globalItems.push(`两份拟改窗口彼此重叠（计划「${esc(p.titles[0])}」(#${p.planIds[0]}) 与「${esc(p.titles[1])}」(#${p.planIds[1]})）`));
+  (c.overlappingPlans || []).forEach((p) =>
+    globalItems.push(`拟改计划「${esc(p.planTitle)}」(#${p.planId}) 与同展品${p.otherStatus === 'pending_review' ? '待复核' : '已批准'}计划「${esc(p.otherTitle)}」(#${p.otherId}) 开灯时间重叠`));
+  (c.missingLimits || []).forEach((y) => globalItems.push(`${y} 年尚未登记年度额度`));
+
+  const years = Object.values(pv.yearlyReport || {}).filter((r) =>
+    r.limit !== null || r.oldResidueTotal > 0 || r.newResidueTotal > 0 || r.usedByOthers > 0);
+  const yearRows = years.map((r) => {
+    const planIds = Object.keys(r.newResidues || {});
+    const contrib = planIds.map((pid) => `#${pid}: ${fmtN(r.oldResidues[pid])}→${fmtN(r.newResidues[pid])}`).join('；');
+    return `<tr class="${r.excess !== null ? 'over-row' : ''}">
+      <td>${r.year}</td>
+      <td class="mono">${r.limit === null ? '未登记' : fmtN(r.limit)}</td>
+      <td class="mono">${fmtN(r.usedByOthers)}</td>
+      <td class="mono small">${contrib}</td>
+      <td class="mono">${fmtN(r.projected)}</td>
+      <td class="mono">${r.remainingAfter === null ? '—' : fmtN(r.remainingAfter)}</td>
+      <td>${r.excess !== null ? `<b style="color:#b42318">超额 ${fmtN(r.excess)}</b>` : '正常'}</td>
+    </tr>`;
+  }).join('');
+  const yearTable = yearRows
+    ? `<table class="data" style="margin-top:8px">
+        <thead><tr><th>年份</th><th>上限</th><th>其他占用</th><th>各计划原残余→拟改残余（lx·h）</th><th>合计</th><th>剩余</th><th>状态</th></tr></thead>
+        <tbody>${yearRows}</tbody>
+      </table>`
+    : '';
+
+  const allBad = globalItems.length || (pv.adjustments || []).some((e) => entryItems(e.conflicts || {}).length);
+  const head = pv.ok
+    ? '<div class="adj-ok"><b>成对核对通过：</b>两份新窗彼此不重叠、与其他计划不重叠、未作废实测均在新窗内，按年替换残余后不超额。可点「成对核准」提交。</div>'
+    : `<div class="adj-conflict"><b>成对核对未通过：</b><ul>${globalItems.map((x) => `<li>${x}</li>`).join('')}</ul></div>`;
+  void allBad;
+  return head + cards + yearTable;
+}
+
+async function pairPreviewRequest() {
+  const ids = readPairSelection();
+  const { pairPreview } = await api('POST', '/api/adjustments/pair/preview', { adjustmentIds: ids });
+  $('#pair-result').innerHTML = pairPreviewHtml(pairPreview);
+  return pairPreview;
+}
+
+$('#pair-preview-btn').addEventListener('click', async () => {
+  try {
+    const pv = await pairPreviewRequest();
+    flash(pv.ok ? 'success' : 'warn',
+      pv.ok ? '成对试算完成：核对通过（试算未改动任何数据）' : '成对试算完成：存在冲突，详见下方明细（试算未改动任何数据）');
+  } catch (err) { flash('error', err.message); }
+});
+
+$('#pair-approve-btn').addEventListener('click', async () => {
+  let ids;
+  try { ids = readPairSelection(); } catch (err) { flash('error', err.message); return; }
+  if (!confirm(`确认成对核准调整申请 #${ids[0]} 与 #${ids[1]}？\n系统将在同一事务内重新核对，全部通过才原子更新两条计划；任一失败则两份申请仍待审、计划与额度不变。`)) return;
+  try {
+    const detail = await api('POST', '/api/adjustments/pair/approve', { adjustmentIds: ids });
+    state.detail = detail;
+    renderDetail();
+    flash('success', `成对核准成功：申请 #${ids[0]}、#${ids[1]} 已结案，两条计划已按拟改值原子更新`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.details && err.data.details.pairPreview) {
+      $('#pair-result').innerHTML = pairPreviewHtml(err.data.details.pairPreview);
+      flash('error', '成对核准未通过核对：两份申请仍待审、计划与额度不变',
+        '<div class="small">详见下方成对试算明细。</div>');
+    } else {
+      flash('error', err.message);
+    }
+  }
+});
+
+$('#pair-adj-a').addEventListener('change', syncPairSelects);
+$('#pair-adj-b').addEventListener('change', syncPairSelects);
+$('#pair-adjust-close').addEventListener('click', () => {
+  $('#pair-adjust-box').classList.add('hidden');
+});
 
 function planRow(p) {
   return `<tr>

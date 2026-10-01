@@ -87,6 +87,33 @@
             <tbody id="detail-plan-tbody"></tbody>
           </table>
 
+          <div id="pair-adjust-box" class="card hidden conservator-only">
+            <div class="panel-head">
+              <h4>成对核准调整申请（两条已批准且未开始计划互换 / 协同挪动档期）</h4>
+              <button type="button" class="link" id="pair-adjust-close">收起</button>
+            </div>
+            <p class="muted small">
+              选择同一展品的<b>两份不同</b>待审调整申请，系统会以两份拟改开灯窗<b>同时替换</b>原窗进行试算：
+              两份新窗彼此、以及与其他已批准/待复核计划均不得重叠；各计划未作废实测须仍落在各自新窗内；
+              按自然年同时替换两条估算残余后任一年超额均会列明年份、各计划贡献与超额量。
+              试算不改动数据；成对核准时在展品锁事务内重新核对，全部通过才原子更新两条计划并结案两份申请，
+              任一失败则两份申请仍待审、计划与额度不变。
+            </p>
+            <div class="form-row">
+              <label class="grow">申请一（计划）
+                <select id="pair-adj-a"></select>
+              </label>
+              <label class="grow">申请二（计划）
+                <select id="pair-adj-b"></select>
+              </label>
+            </div>
+            <div class="adj-btns">
+              <button type="button" id="pair-preview-btn">成对试算</button>
+              <button type="button" class="primary" id="pair-approve-btn">成对核准</button>
+            </div>
+            <div id="pair-result"></div>
+          </div>
+
           <h4>实测记录</h4>
           <table class="data">
             <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>

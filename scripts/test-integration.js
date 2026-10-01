@@ -863,6 +863,329 @@ async function runFlow() {
     '操作流水记录了下调上限导致的转待复核');
   assert(r.body.events.some((e) => e.action === 'limit.upsert'),
     '操作流水记录了登记/修改上限');
+
+  await runPairFlow(call, assert, { createExhibit, submitPlan, approvePlan });
+}
+
+/**
+ * 成对核准（两份待审调整申请同时替换窗口）端到端流程。
+ * 覆盖：
+ *  - 结构性拒绝：越权、同一计划、跨展品、申请已结案、编号缺失/相同
+ *  - 档期互换：各自单批会与对方原窗冲突，成对试算/核准通过，两窗对调、额度按对同时替换
+ *  - 两新窗彼此重叠 / 与第三计划重叠 / 窗外未作废实测 / 按年超额（列各计划贡献与超额量）
+ *  - 409 失败后两份申请仍待审、计划与额度不变；提额后同两份申请可成对核准
+ *  - 成功后原子更新两条计划、结案两份申请、记审计；既有单份审批/查询字段保持兼容
+ */
+async function runPairFlow(call, assert, helpers) {
+  const { createExhibit, submitPlan, approvePlan } = helpers;
+
+  // ------------------------------------------------------------------
+  // 场景一：档期互换（同一日，两条已批准未开始计划对调开灯时段）
+  // ------------------------------------------------------------------
+  const exP = await createExhibit('成对互换展品');
+  await call('POST', `/api/exhibits/${exP}/limits`, { year: 2035, limitLxh: 2000 }, 'c');
+
+  // 计划 P1：2035-05-01 09:00-12:00（300）；P2：2035-05-01 13:00-17:00（400）
+  const p1 = await submitPlan(exP, '互换计划1', '2035-05-01', '2035-05-01', ['09:00-12:00'], 100);
+  const p2 = await submitPlan(exP, '互换计划2', '2035-05-01', '2035-05-01', ['13:00-17:00'], 100);
+  await approvePlan(p1);
+  await approvePlan(p2);
+
+  // P1 申请改到 13:00-17:00（P2 现窗口）；P2 申请改到 09:00-12:00（P1 现窗口）
+  let r = await call('POST', '/api/adjustments', {
+    planId: p1, startDate: '2035-05-01', endDate: '2035-05-01',
+    periods: ['13:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, 'P1 提交互换申请');
+  const a1 = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.ok === false,
+    '单份试算：P1 拟改窗与 P2 现窗口重叠（不通过）');
+  assert(r.body.adjustment.preview.conflicts.overlappingPlans.some((p) => p.id === p2),
+    '单份试算指出与 P2 冲突');
+
+  r = await call('POST', '/api/adjustments', {
+    planId: p2, startDate: '2035-05-01', endDate: '2035-05-01',
+    periods: ['09:00-12:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, 'P2 提交互换申请');
+  const a2 = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.ok === false,
+    '单份试算：P2 拟改窗与 P1 现窗口重叠（不通过）');
+
+  // ---- 结构性拒绝 ----
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [a1, a2] }, 'i');
+  assert(r.status === 403, '布展员不能成对试算（越权）');
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [a1, a2] }, 'i');
+  assert(r.status === 403, '布展员不能成对核准（越权）');
+
+  r = await call('POST', '/api/adjustments/pair/preview', { a: a1 }, 'c');
+  assert(r.status === 400 && /两个/.test(r.body.error), '只给一个编号被拒绝');
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [a1, a1] }, 'c');
+  assert(r.status === 400 && /不同/.test(r.body.error), '两个相同编号被拒绝');
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [a1, 999999] }, 'c');
+  assert(r.status === 400 && /不存在/.test(r.body.error), '不存在的申请编号被拒绝');
+
+  // 同一计划的两份申请不可能同时 pending（唯一索引）；用 P1 的申请与另一条同计划已结案申请验证
+  // 这里用撤回后重提制造一份同计划 withdrawn 记录
+  const wRow = await call('POST', `/api/adjustments/${a2}/withdraw`, {}, 'i');
+  assert(wRow.status === 200, '撤回 a2 以制造同计划再提');
+  r = await call('POST', '/api/adjustments', {
+    planId: p2, startDate: '2035-05-01', endDate: '2035-05-01',
+    periods: ['09:00-12:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, 'P2 重新提交互换申请 a2b');
+  const a2b = r.body.adjustment.id;
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [a2, a2b] }, 'c');
+  assert(r.status === 400 && /已结案/.test(r.body.error), '含已结案（撤回）申请被拒绝并指出原因');
+
+  // 跨展品
+  const exOther = await createExhibit('成对跨展品');
+  await call('POST', `/api/exhibits/${exOther}/limits`, { year: 2035, limitLxh: 5000 }, 'c');
+  const pOther = await submitPlan(exOther, '他展品计划', '2035-06-01', '2035-06-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(pOther);
+  r = await call('POST', '/api/adjustments', {
+    planId: pOther, startDate: '2035-06-02', endDate: '2035-06-02',
+    periods: ['09:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  const aOther = r.body.adjustment.id;
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [a1, aOther] }, 'c');
+  assert(r.status === 400 && /不同展品/.test(r.body.error), '跨展品的两份申请被拒绝并指出原因');
+
+  // ---- 成对试算通过（互换）----
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [a1, a2b] }, 'c');
+  assert(r.status === 200, '互换成对试算成功');
+  let pv = r.body.pairPreview;
+  assert(pv.ok === true, '互换成对试算核对通过');
+  assert(pv.adjustments.length === 2 &&
+    pv.adjustments.some((e) => e.adjustmentId === a1) &&
+    pv.adjustments.some((e) => e.adjustmentId === a2b), '试算返回两份申请明细');
+  assert(pv.conflicts.pairOverlaps.length === 0, '两新窗不重叠（互换成功）');
+  assert(pv.conflicts.overlappingPlans.length === 0, '与其他计划不重叠');
+  const row35 = pv.yearlyReport['2035'];
+  assert(row35 && row35.projected === 700 && row35.limit === 2000,
+    `2035 合计=其他0+300+400=700，实际 ${JSON.stringify(row35)}`);
+  // 各计划贡献：300 与 400（两窗对调，剂量不变）
+  const newResVals = Object.values(row35.newResidues).sort((x, y) => x - y);
+  assert(newResVals.join(',') === '300,400', `各计划拟改残余 300/400，实际 ${newResVals}`);
+  // 试算不写库：申请仍待审、计划不变
+  r = await call('GET', `/api/plans/${p1}`, null, 'i');
+  assert(ymd(r.body.plan.start_date) === '2035-05-01' &&
+    (r.body.plan.light_periods || []).includes('09:00-12:00'), '试算不修改计划 P1');
+
+  // ---- 成对核准成功：原子更新 + 结案 + 审计 ----
+  r = await call('POST', '/api/adjustments/pair/approve', { a: a1, b: a2b }, 'c');
+  assert(r.status === 200, '互换成对核准成功');
+  assert(r.body.exhibit && r.body.years && r.body.plans, '成功响应仍为展品详情（兼容）');
+  let gp1 = await call('GET', `/api/plans/${p1}`, null, 'i');
+  let gp2 = await call('GET', `/api/plans/${p2}`, null, 'i');
+  assert((gp1.body.plan.light_periods || []).includes('13:00-17:00'), 'P1 窗口已更新为下午');
+  assert((gp2.body.plan.light_periods || []).includes('09:00-12:00'), 'P2 窗口已更新为上午');
+  assert(!gp1.body.plan.pendingAdjustment && !gp2.body.plan.pendingAdjustment,
+    '两条计划均无待审申请（已结案）');
+  const ga1 = await call('GET', `/api/adjustments/${a1}`, null, 'i');
+  const ga2 = await call('GET', `/api/adjustments/${a2b}`, null, 'i');
+  assert(ga1.body.adjustment.status === 'approved' && ga2.body.adjustment.status === 'approved',
+    '两份申请均已结案为 approved');
+  // 额度：300+400=700（与互换前一致）
+  r = await call('GET', `/api/exhibits/${exP}`, null, 'i');
+  assert(r.body.years['2035'].used === 700, `互换后 2035 占用 700，实际 ${r.body.years['2035'].used}`);
+
+  // 审计
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.filter((e) => e.action === 'plan.adjustment.pair_approve' &&
+    JSON.stringify(e.detail.pairAdjustmentIds).includes(String(a1))).length === 2,
+    '两份申请各写一条成对核准审计');
+  assert(r.body.events.some((e) => e.action === 'plan.update_via_pair_adjustment' &&
+    e.target_id === p1), 'P1 写计划经成对调整更新审计');
+
+  // 已结案申请不能再成对核准
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [a1, a2b] }, 'c');
+  assert(r.status === 400 && /已结案/.test(r.body.error), '已结案申请再次成对核准被拒绝');
+
+  // 既有单份审批/查询字段保持兼容：P1/P2 详情仍带原字段
+  assert(gp1.body.plan.id === p1 && gp1.body.estimatedYearly['2035'] === 400,
+    '单份计划详情字段保持兼容（P1 现 4h=400）');
+  r = await call('GET', `/api/adjustments?planId=${p1}`, null, 'i');
+  assert(r.body.adjustments.some((x) => x.id === a1 && x.status === 'approved'),
+    '调整申请列表查询保持兼容');
+
+  // ------------------------------------------------------------------
+  // 场景二：两新窗彼此重叠（非互换）
+  // ------------------------------------------------------------------
+  const exS = await createExhibit('成对互叠展品');
+  await call('POST', `/api/exhibits/${exS}/limits`, { year: 2036, limitLxh: 5000 }, 'c');
+  const s1 = await submitPlan(exS, '互叠计划1', '2036-05-01', '2036-05-01', ['09:00-12:00'], 100);
+  const s2 = await submitPlan(exS, '互叠计划2', '2036-05-02', '2036-05-02', ['13:00-17:00'], 100);
+  await approvePlan(s1);
+  await approvePlan(s2);
+  // 两份申请都改到 2036-06-01 09:00-11:00（彼此重叠）
+  r = await call('POST', '/api/adjustments', {
+    planId: s1, startDate: '2036-06-01', endDate: '2036-06-01',
+    periods: ['09:00-11:00'], estimatedLux: 100,
+  }, 'i');
+  const sa1 = r.body.adjustment.id;
+  r = await call('POST', '/api/adjustments', {
+    planId: s2, startDate: '2036-06-01', endDate: '2036-06-01',
+    periods: ['10:00-12:00'], estimatedLux: 100,
+  }, 'i');
+  const sa2 = r.body.adjustment.id;
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [sa1, sa2] }, 'c');
+  assert(r.status === 200 && r.body.pairPreview.ok === false, '两新窗彼此重叠：试算不通过');
+  assert(r.body.pairPreview.conflicts.pairOverlaps.length === 1, '指出彼此重叠');
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [sa1, sa2] }, 'c');
+  assert(r.status === 409 && /彼此重叠/.test(r.body.error), '成对核准因彼此重叠返回 409');
+  assert(r.body.details.pairPreview && r.body.details.pairPreview.ok === false,
+    '409 details 带成对试算结果');
+  // 申请仍待审、计划不变
+  r = await call('GET', `/api/adjustments/${sa1}`, null, 'i');
+  assert(r.body.adjustment.status === 'pending', '409 后申请一仍待审');
+  r = await call('GET', `/api/adjustments/${sa2}`, null, 'i');
+  assert(r.body.adjustment.status === 'pending', '409 后申请二仍待审');
+
+  // ------------------------------------------------------------------
+  // 场景三：与第三计划重叠 + 窗外未作废实测 + 按年超额（各计划贡献与超额量）
+  // ------------------------------------------------------------------
+  const exC = await createExhibit('成对冲突展品');
+  await call('POST', `/api/exhibits/${exC}/limits`, { year: 2037, limitLxh: 2000 }, 'c');
+  // c1=800, c2=800（占用 1600）；c3=200 第三计划（占用 1800，剩余 200）
+  const c1 = await submitPlan(exC, '协同计划1', '2037-05-01', '2037-05-01', ['09:00-17:00'], 100);
+  const c2 = await submitPlan(exC, '协同计划2', '2037-05-02', '2037-05-02', ['09:00-17:00'], 100);
+  const c3 = await submitPlan(exC, '第三计划', '2037-05-03', '2037-05-03', ['09:00-11:00'], 100);
+  await approvePlan(c1);
+  await approvePlan(c2);
+  await approvePlan(c3);
+  // 调整 1：改到 2037-05-03 09:30-12:30 -> 与 c3(09-11) 重叠；同时窗口拉长到 3h=300
+  r = await call('POST', '/api/adjustments', {
+    planId: c1, startDate: '2037-05-03', endDate: '2037-05-03',
+    periods: ['09:30-12:30'], estimatedLux: 100,
+  }, 'i');
+  const ca1 = r.body.adjustment.id;
+  // 调整 2：改到 2037-05-04 09:00-17:00（800，不与他人重叠），但把照度提高到 150（1200）-> 超额
+  r = await call('POST', '/api/adjustments', {
+    planId: c2, startDate: '2037-05-04', endDate: '2037-05-04',
+    periods: ['09:00-17:00'], estimatedLux: 150,
+  }, 'i');
+  const ca2 = r.body.adjustment.id;
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [ca1, ca2] }, 'c');
+  assert(r.status === 200 && r.body.pairPreview.ok === false, '场景三试算不通过');
+  pv = r.body.pairPreview;
+  assert(pv.conflicts.overlappingPlans.some((p) => p.planId === c1 && p.otherId === c3),
+    '指出调整1与第三计划 c3 重叠');
+  const ov = pv.yearlyReport['2037'];
+  // 其他占用=c3=200；c1 新残余 300；c2 新残余 1200；合计 1700 ≤ 2000（本场景不超额）
+  assert(ov.projected === 1700 && ov.excess === null,
+    `重叠场景下额度本身不超额（1700/2000），实际 ${JSON.stringify(ov)}`);
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [ca1, ca2] }, 'c');
+  assert(r.status === 409 && /第三计划/.test(r.body.error), '与第三计划重叠导致 409');
+  assert(/拟改计划/.test(r.body.error) && /计划「第三计划」\(#\d+\)/.test(r.body.error),
+    '错误信息指出涉及计划与第三计划');
+
+  // ---- 窗外未作废实测（draft 也算）：在 c1 当前窗内录一条 draft，再把 c1 申请改到不含它的日子 ----
+  // 先撤回 ca1，改提交一个不与 c3 重叠但排除实测的窗口
+  await call('POST', `/api/adjustments/${ca1}/withdraw`, {}, 'i');
+  r = await call('POST', '/api/measurements', {
+    planId: c1, startDate: '2037-05-01', startTime: '09:00',
+    endDate: '2037-05-01', endTime: '11:00', actualLux: 100,
+  }, 'c');
+  assert(r.status === 201, '在 c1 当前窗内录入实测草稿');
+  const cm = r.body.measurement.id;
+  r = await call('POST', '/api/adjustments', {
+    planId: c1, startDate: '2037-06-01', endDate: '2037-06-01',
+    periods: ['09:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  const ca1b = r.body.adjustment.id;
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [ca1b, ca2] }, 'c');
+  assert(r.status === 200 && r.body.pairPreview.ok === false, '含窗外实测：试算不通过');
+  const entryC1 = r.body.pairPreview.adjustments.find((e) => e.planId === c1);
+  assert(entryC1.conflicts.outsideMeasurements.some((m) => m.id === cm),
+    '指出 c1 的窗外未作废实测');
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [ca1b, ca2] }, 'c');
+  assert(r.status === 409 && new RegExp(`实测 #${cm}`).test(r.body.error), '窗外实测导致 409');
+  await call('DELETE', `/api/measurements/${cm}`, null, 'c'); // 删草稿解除该冲突
+
+  // ---- 按年超额：其他占用 200 + c1新800 + c2新1200 = 2200，超额 200 ----
+  // ca1b 现为 2037-06-01 09-17=800（不与他人重叠），ca2=1200
+  r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [ca1b, ca2] }, 'c');
+  assert(r.status === 200 && r.body.pairPreview.ok === false, '超额场景试算不通过');
+  const ov37 = r.body.pairPreview.yearlyReport['2037'];
+  assert(ov37.projected === 2200 && ov37.excess === 200,
+    `2037 合计 2200、超额 200，实际 ${JSON.stringify(ov37)}`);
+  assert(ov37.usedByOthers === 200, '其他占用为第三计划 200');
+  const contribVals = Object.values(ov37.newResidues).sort((x, y) => x - y);
+  assert(contribVals.join(',') === '800,1200',
+    `列出各计划拟改残余贡献 800/1200，实际 ${contribVals}`);
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [ca1b, ca2] }, 'c');
+  assert(r.status === 409 && /2037 年/.test(r.body.error) && /超额 200/.test(r.body.error),
+    '成对核准因按年超额返回 409 且列明年份与超额量：' + r.body.error);
+  assert(/计划 #\d+：原残余 \d+，拟改残余 \d+/.test(r.body.error),
+    '错误信息列出各计划原残余与拟改残余贡献');
+  // 失败后计划与额度不变：c1/c2 仍为原窗口，2037 占用 1800
+  r = await call('GET', `/api/exhibits/${exC}`, null, 'i');
+  assert(r.body.years['2037'].used === 1800, `409 后额度不变（1800），实际 ${r.body.years['2037'].used}`);
+  const rowC1 = r.body.plans.find((p) => p.id === c1);
+  const rowC2 = r.body.plans.find((p) => p.id === c2);
+  assert(ymd(rowC1.start_date) === '2037-05-01' && ymd(rowC2.start_date) === '2037-05-02',
+    '409 后两条计划展期不变');
+  assert(rowC1.pendingAdjustment.id === ca1b && rowC2.pendingAdjustment.id === ca2,
+    '409 后两份申请仍待审');
+
+  // 提额后同两份申请无需撤回重提，可成对核准
+  await call('POST', `/api/exhibits/${exC}/limits`, { year: 2037, limitLxh: 2400 }, 'c');
+  r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [ca1b, ca2] }, 'c');
+  assert(r.status === 200, '提额后同两份申请成对核准成功');
+  assert(r.body.years['2037'].used === 2200 && r.body.years['2037'].remaining === 200,
+    `成对更新后 2037 占用 2200、剩余 200，实际 ${r.body.years['2037'].used}`);
+  gp1 = await call('GET', `/api/plans/${c1}`, null, 'i');
+  gp2 = await call('GET', `/api/plans/${c2}`, null, 'i');
+  assert(ymd(gp1.body.plan.start_date) === '2037-06-01' &&
+    gp2.body.plan.estimated_lux === 150, '两条计划均按各自拟改值更新');
+
+  // ------------------------------------------------------------------
+  // 场景四：计划已开始（锁内状态变化）→ 409 且申请保持待审
+  // 直接在库中构造一条“首个开灯时刻已过”的已批准计划并挂待审申请，
+  // 走 HTTP 成对接口验证提交时在锁事务内重新核对。
+  // ------------------------------------------------------------------
+  const dbModule2 = require('../src/db');
+  const exD = await createExhibit('成对已开始展品');
+  await call('POST', `/api/exhibits/${exD}/limits`, { year: 2026, limitLxh: 10000 }, 'c');
+  await call('POST', `/api/exhibits/${exD}/limits`, { year: 2027, limitLxh: 10000 }, 'c');
+  const d2 = await submitPlan(exD, '未来搭档', '2027-05-02', '2027-05-02',
+    ['13:00-17:00'], 100);
+  await approvePlan(d2);
+  // 直接插入一条已开始（2026 墙上时间，当前 2026-10 之后）的已批准计划与待审申请
+  const insPlan = await dbModule2.query(
+    `INSERT INTO plans (exhibit_id, title, start_date, end_date, light_periods, estimated_lux,
+                        status, created_by, approved_by, approved_at)
+     VALUES ($1, '已开始搭档', '2026-03-01', '2026-03-01', $2::jsonb, 100,
+             'approved', $3, $3, now()) RETURNING id`,
+    [exD, JSON.stringify(['09:00-12:00']), 1]
+  );
+  const d1 = Number(insPlan.rows[0].id);
+  const insAdj = await dbModule2.query(
+    `INSERT INTO plan_adjustments (plan_id, exhibit_id, start_date, end_date, light_periods,
+                                   estimated_lux, status, created_by)
+     VALUES ($1, $2, '2027-05-01', '2027-05-01', $3::jsonb, 100, 'pending', $4) RETURNING id`,
+    [d1, exD, JSON.stringify(['09:00-12:00']), 1]
+  );
+  const da1 = Number(insAdj.rows[0].id);
+  const da2Resp = await call('POST', '/api/adjustments', {
+    planId: d2, startDate: '2027-05-02', endDate: '2027-05-02',
+    periods: ['13:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  // d2 已批准未开始，但注意它已有无待审——这是首份，可提交
+  let da2 = null;
+  if (da2Resp.status === 201) da2 = da2Resp.body.adjustment.id;
+  if (da2) {
+    r = await call('POST', '/api/adjustments/pair/preview', { adjustmentIds: [da1, da2] }, 'c');
+    assert(r.status === 200 && r.body.pairPreview.ok === false, '含已开始计划：试算不通过');
+    assert(r.body.pairPreview.adjustments.find((e) => e.planId === d1).conflicts.notStarted,
+      '指出计划已开始');
+    r = await call('POST', '/api/adjustments/pair/approve', { adjustmentIds: [da1, da2] }, 'c');
+    assert(r.status === 409 && /已经开始/.test(r.body.error), '计划已开始导致成对核准 409');
+    r = await call('GET', `/api/adjustments/${da1}`, null, 'i');
+    assert(r.body.adjustment.status === 'pending', '409 后已开始计划的申请仍待审');
+  }
 }
 
 main().catch((err) => {

@@ -42,6 +42,18 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
     - 下调成功**原子更新上限**，**原审批记录与实测记录全部保留**；把本次核算列出的未开始计划**转为待复核并写明原因**；
       **已开始的计划不转状态**，剩余超额仍在额度查询/页面中如实显示。后续复核沿用既有的重叠与额度校验，
       不删除占用、不自动取消计划。
+12. **成对核准调整申请（互换/协同挪动档期）**：保管员可选择**同一展品的两份不同待审调整申请成对核准**，
+    用于两条**已批准且未开始**的计划互换或协同挪动档期。
+    - 输入两个不同申请编号；若**关联同一计划、跨展品、计划已开始或申请已结案**，一律拒绝并指出原因。
+    - **试算与提交均以两份拟改开灯窗同时替换原窗**：
+      两份新窗**彼此**、以及与同展品**其他已批准/待复核**计划的开灯时刻均不得重叠；
+      每条计划的所有**未作废实测（含待确认）须仍落在各自新窗内**；
+      按自然年同时以两条「未被已确认实测覆盖部分」的估算残余替换旧残余，
+      任一年超过年度上限即列出**年份、各计划贡献（原残余→拟改残余）与超额量**。
+    - **提交在展品锁事务内重新核对**，全部通过才**原子更新两条计划、结案两份申请并记审计**；
+      任一失败则两份申请**仍待审**、计划与额度不变（409，返回结构化成对核对结果）。
+    - 单份审批、驳回、撤回与查询的字段和行为**保持兼容**；新增接口为
+      `POST /api/adjustments/pair/preview`（仅试算）与 `POST /api/adjustments/pair/approve`（成对核准，仅保管员）。
 
 ## 一键启动（Docker Compose）
 
@@ -118,13 +130,18 @@ npm run test:utils
    若迟到实测造成年度超限，相应未开始计划转待复核，保管员在详情页复核。
 5. 计划尚未开始时，布展员可在「布展计划」对该计划点「申请调整」，改填展期/开灯时段/照度后提交；
    保管员在计划行内查看原值与拟改值对照及核对结果，选择「批准调整」或「驳回」；布展员可撤回自己的待审申请后重提。
-6. 需要**下调**某展品某自然年上限时，保管员在展品详情填写年份与拟定上限后点「下调预演」：
+6. 两条已批准且未开始的计划需要**互换或协同挪动档期**时，布展员分别为两条计划提交调整申请后，
+   保管员在**展品详情「成对核准调整申请」**面板选择这两份申请点「成对试算」：
+   页面并列展示两份原值/拟改值、各自窗外实测、两窗彼此及与其他计划的重叠，以及按自然年的
+   「其他占用 + 各计划原残余→拟改残余 + 合计 + 剩余 + 超额」核算表；确认无误后点「成对核准」，
+   系统在展品锁事务内重新核对，全部通过才原子更新两条计划、结案两份申请；任一失败两份申请仍待审、计划与额度不变。
+7. 需要**下调**某展品某自然年上限时，保管员在展品详情填写年份与拟定上限后点「下调预演」：
    页面列出该年已确认实测、各计划估算残余、预计超额量，以及将被转待复核的未开始计划；
    确认后在预演结果中点「提交下调」。若预演后占用被他人改动，提交会被拒绝并自动展示最新预演结果。
    已开始计划不会被转状态，剩余超额继续在额度表中红色显示，待复核计划由保管员复核（沿用既有重叠/额度校验）。
-7. 「操作流水」保留全部审批、调整、确认、上限下调、状态变更等记录。
+8. 「操作流水」保留全部审批、调整（含成对核准）、确认、上限下调、状态变更等记录。
 
-## HTTP API（含计划调整申请、年度上限下调预演）
+## HTTP API（含计划调整申请、成对核准、年度上限下调预演）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -166,6 +183,8 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `POST /api/adjustments` | 布展员 | 对已批准且未开始的计划提交调整申请（每计划至多一份待审） |
 | `POST /api/adjustments/preview` | 布展员 | 仅试算拟改值，不写库 |
+| `POST /api/adjustments/pair/preview` | 保管员 | **成对试算**：两份拟改窗同时替换原窗，不写库 |
+| `POST /api/adjustments/pair/approve` | 保管员 | **成对核准**：锁事务内重新核对，通过则原子更新两条计划、结案两份申请 |
 | `GET  /api/adjustments?planId=&exhibitId=&status=&preview=1` | 登录 | 申请列表/历史，带原值 |
 | `GET  /api/adjustments/:id` | 登录 | 申请详情（待审带试算） |
 | `POST /api/adjustments/:id/approve` | 保管员 | 批准：锁事务内重新核对，通过则原子更新计划 |
@@ -207,6 +226,84 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/1/re
 # 3c) 布展员撤回（之后可用同一 planId 重新提交）
 curl -b cookies.txt -X POST http://localhost:3000/api/adjustments/1/withdraw
 ```
+
+### 成对核准 `/api/adjustments/pair/preview`、`/pair/approve`
+
+保管员把**同一展品两份不同待审调整申请**成对试算/核准（用于两条已批准且未开始计划互换或协同挪动档期）。
+请求体提供两个不同申请编号，支持 `adjustmentIds: [id1, id2]` 或 `{ "a": id1, "b": id2 }`。
+
+- **结构性拒绝（400，直接指出原因）**：编号缺失/相同/不存在、两份申请关联**同一计划**、**跨展品**、任一申请**已结案**（approved/rejected/withdrawn）。
+- **业务核对失败（409）**：计划已开始/不再是已批准、未作废实测落在窗外、两新窗彼此重叠、与其他已批准/待复核计划重叠、未登记年度额度、按年超额。
+- 409 时两份申请**保持 pending**、计划与额度不变，`details.pairPreview` 为结构化成对核对结果。
+- 仅**保管员**可调用；布展员调用返回 403。
+
+```bash
+# 1) 成对试算（不写库）：返回两份原值/拟改值、各自冲突与按年同时替换的核算结果
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/pair/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"adjustmentIds":[10,11]}'
+# 等价写法：-d '{"a":10,"b":11}'
+
+# 2) 成对核准：锁事务内重新核对；全部通过才原子更新两条计划、结案两份申请
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/adjustments/pair/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"adjustmentIds":[10,11]}'
+```
+
+成对试算响应（`pairPreview`）：
+
+```json
+{
+  "adjustmentIds": [10, 11],
+  "exhibitId": 3,
+  "ok": true,
+  "adjustments": [
+    {
+      "adjustmentId": 10, "planId": 7, "planTitle": "春展A", "status": "approved",
+      "original": { "startDate": "2030-05-01", "endDate": "2030-05-01",
+                    "periods": ["09:00-12:00"], "estimatedLux": 100 },
+      "proposed": { "startDate": "2030-05-01", "endDate": "2030-05-01",
+                    "periods": ["13:00-17:00"], "estimatedLux": 100 },
+      "conflicts": { "notApproved": false, "notStarted": false, "outsideMeasurements": [] },
+      "oldResidueYearly": { "2030": 300 },
+      "newResidueYearly": { "2030": 400 }
+    },
+    { "adjustmentId": 11, "planId": 8, "...": "另一份（拟改到 09:00-12:00）" }
+  ],
+  "conflicts": {
+    "pairOverlaps": [],
+    "overlappingPlans": [],
+    "overflows": [],
+    "missingLimits": []
+  },
+  "yearlyReport": {
+    "2030": {
+      "year": 2030, "limit": 2000, "usedByOthers": 0,
+      "oldResidues": { "7": 300, "8": 400 },
+      "newResidues": { "7": 400, "8": 300 },
+      "oldResidueTotal": 700, "newResidueTotal": 700,
+      "projected": 700, "remainingAfter": 1300, "excess": null
+    }
+  }
+}
+```
+
+超额时 `conflicts.overflows` 与 `yearlyReport.<年>` 给出**年份、上限、其他占用、各计划原残余/拟改残余贡献、合计与超额量**；
+成对核准失败（409）示例：
+
+```json
+{
+  "error": "成对核准申请 #10、#11 未通过核对：…2030 年：上限 2000，其他占用 200，计划 #7：原残余 300，拟改残余 800；计划 #8：原残余 400，拟改残余 1200，合计 2200，超额 200 lx·h",
+  "details": {
+    "adjustmentIds": [10, 11],
+    "pairPreview": { "ok": false, "adjustments": [], "conflicts": {}, "yearlyReport": {} }
+  }
+}
+```
+
+成功响应即**展品详情**（与 `GET /api/exhibits/:id` 同构，保持兼容）；
+操作流水新增两类动作：`plan.adjustment.pair_approve`（逐份申请各一条，detail 带 `pairAdjustmentIds`）
+与 `plan.update_via_pair_adjustment`（逐计划各一条）。
 
 批准核对失败时返回 **409**，申请保持 `pending`，`details.conflicts` 给出全部冲突：
 
