@@ -177,6 +177,7 @@ async function openDetail(id) {
   $('#new-exhibit-btn').classList.add('hidden');
   $('#exhibit-detail').classList.remove('hidden');
   hideLimitPreview();
+  $('#pair-result').innerHTML = '';
   renderDetail();
 }
 $('#close-detail').addEventListener('click', () => {
@@ -223,6 +224,7 @@ function renderDetail() {
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
   $$('.adj-action').forEach((btn) => btn.addEventListener('click', () => adjustmentAction(btn)));
   $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
+  renderPairBox();
 }
 
 function planRow(p) {
@@ -753,6 +755,137 @@ async function adjustmentAction(btn) {
     flash('error', err.message);
   }
 }
+
+// ---------- 成对核准调整申请（保管员，同一展品两份待审申请） ----------
+/** 用本展品各计划的待审申请填充两个下拉框，并尽量保留已选项。 */
+function renderPairBox() {
+  const first = $('#pair-first');
+  const second = $('#pair-second');
+  if (!first || !second) return;
+  const pendings = (state.detail.plans || [])
+    .filter((p) => p.pendingAdjustment)
+    .map((p) => ({ adj: p.pendingAdjustment, plan: p }))
+    .sort((a, b) => a.adj.id - b.adj.id);
+  const keep1 = first.value;
+  const keep2 = second.value;
+  const opts = pendings.map(({ adj, plan }) =>
+    `<option value="${adj.id}">申请 #${adj.id} → 计划 #${plan.id}「${esc(plan.title)}」</option>`).join('');
+  first.innerHTML = opts || '<option value="">（本展品暂无待审申请）</option>';
+  second.innerHTML = opts || '<option value="">（本展品暂无待审申请）</option>';
+  if (pendings.some((p) => String(p.adj.id) === keep1)) first.value = keep1;
+  if (pendings.some((p) => String(p.adj.id) === keep2)) second.value = keep2;
+  // 默认让两个下拉选中不同申请，便于直接试算
+  if (first.value === second.value && pendings.length > 1) {
+    const other = pendings.find((p) => String(p.adj.id) !== first.value);
+    if (other) second.value = String(other.adj.id);
+  }
+}
+
+/** 成对核对冲突明细（结构与单份不同：状态类为数组、含 pairOverlap、超额含各计划贡献）。 */
+function pairConflictsHtml(conflicts) {
+  const c = conflicts || {};
+  const items = [];
+  (c.notApproved || []).forEach((x) =>
+    items.push(`计划 #${x.planId} 已不是「已批准」状态（当前：${STATUS_TEXT[x.status] || x.status}）`));
+  (c.notStarted || []).forEach((x) => items.push(`计划 #${x.planId} 已经开始`));
+  (c.outsideMeasurements || []).forEach((m) =>
+    items.push(`计划 #${m.planId} 的未作废实测 #${m.id}（${esc(m.start)} ~ ${esc(m.end)}，${STATUS_TEXT[m.status] || m.status}）不在其新开灯窗内`));
+  if (c.pairOverlap) items.push('两份拟改开灯窗彼此重叠');
+  (c.overlappingPlans || []).forEach((p) =>
+    items.push(`申请 #${p.adjustmentId} 的拟改窗与同展品${p.other.status === 'pending_review' ? '待复核' : '已批准'}计划「${esc(p.other.title)}」(#${p.other.id}) 开灯时间重叠`));
+  (c.missingLimits || []).forEach((y) => items.push(`${y} 年尚未登记年度额度`));
+  (c.overflows || []).forEach((o) =>
+    items.push(`${o.year} 年超额 <b>${fmtN(o.excess)} lx·h</b>（上限 ${fmtN(o.limit)}，其他占用 ${fmtN(o.usedByOthers)}，` +
+      `两份拟改残余合计 ${fmtN(o.newResidueTotal)}：${(o.contributions || []).map((ct) => `计划 #${ct.planId} 贡献 ${fmtN(ct.newResidue)}`).join('，')}，` +
+      `合计 ${fmtN(o.projected)}）`));
+  if (items.length === 0) {
+    return '<div class="adj-ok">成对核对通过：两份拟改开灯窗可同时替换原窗。</div>';
+  }
+  return `<div class="adj-conflict"><b>成对核对未通过：</b><ul>${items.map((x) => `<li>${x}</li>`).join('')}</ul></div>`;
+}
+
+/** 成对试算的按年报告表（两计划残余同时替换）。 */
+function pairYearlyHtml(yearlyReport) {
+  const rows = Object.values(yearlyReport || {});
+  if (!rows.length) return '';
+  const contrib = (list, key) => (list || []).map((ct) => `#${ct.planId}:${fmtN(ct[key])}`).join(' + ');
+  return `<table class="data" style="margin-top:8px"><thead><tr>
+      <th>年份</th><th>上限</th><th>其他占用</th><th>两计划原残余</th><th>两计划拟改残余</th><th>替换后合计</th><th>状态</th>
+    </tr></thead><tbody>${rows.map((y) => `<tr class="${y.excess ? 'over-row' : ''}">
+      <td>${y.year}</td>
+      <td class="mono">${y.limit === null ? '未登记' : fmtN(y.limit)}</td>
+      <td class="mono">${fmtN(y.usedByOthers)}</td>
+      <td class="mono">${fmtN(y.oldResidueTotal)}<div class="small muted">${contrib(y.contributions, 'oldResidue')}</div></td>
+      <td class="mono">${fmtN(y.newResidueTotal)}<div class="small muted">${contrib(y.contributions, 'newResidue')}</div></td>
+      <td class="mono">${fmtN(y.projected)}</td>
+      <td>${y.limit === null ? '<span class="muted">无法核算</span>'
+        : y.excess ? `<b style="color:#b42318">超额 ${fmtN(y.excess)}</b>` : '正常'}</td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+/** 渲染成对试算/核对结果（stale=true 表示提交被拒后的最新核对）。 */
+function renderPairResult(payload, { stale = false } = {}) {
+  const box = $('#pair-result');
+  const adjHtml = (payload.adjustments || []).map((a) => `<div class="adj-box">
+    <div class="adj-head">申请 #${a.id} → 计划 #${a.planId}「${esc((a.original && a.original.title) || '')}」</div>
+    ${a.original ? scheduleDiff(a.original, {
+      startDate: a.startDate, endDate: a.endDate, periods: a.periods, estimatedLux: a.estimatedLux,
+    }) : ''}
+  </div>`).join('');
+  box.innerHTML =
+    (stale ? '<div class="adj-conflict">提交未通过核对，以下为最新核对结果；两份申请仍待审、计划与额度不变。</div>' : '') +
+    adjHtml + pairConflictsHtml(payload.conflicts) + pairYearlyHtml(payload.yearlyReport);
+}
+
+/** 读取两个下拉框选中的申请编号；无效时提示并返回 null。 */
+function selectedPairIds() {
+  const ids = [Number($('#pair-first').value), Number($('#pair-second').value)];
+  if (!ids.every((x) => Number.isInteger(x) && x > 0)) {
+    flash('error', '本展品暂无可选的待审调整申请');
+    return null;
+  }
+  if (ids[0] === ids[1]) {
+    flash('error', '请选择两份不同的待审调整申请');
+    return null;
+  }
+  return ids;
+}
+
+$('#pair-preview-btn').addEventListener('click', async () => {
+  const ids = selectedPairIds();
+  if (!ids) return;
+  try {
+    const { pairPreview } = await api('POST', '/api/adjustments/pair/preview', { adjustmentIds: ids });
+    renderPairResult(pairPreview);
+    flash(pairPreview.ok ? 'success' : 'warn',
+      pairPreview.ok ? '成对试算通过：可提交核准' : '成对试算存在冲突，见下方明细');
+  } catch (err) { flash('error', err.message); }
+});
+
+$('#pair-approve-btn').addEventListener('click', async () => {
+  const ids = selectedPairIds();
+  if (!ids) return;
+  if (!confirm(`确认成对核准申请 #${ids[0]} 与 #${ids[1]}？两条计划将同时按拟改值更新。`)) return;
+  try {
+    const detail = await api('POST', '/api/adjustments/pair/approve', { adjustmentIds: ids });
+    state.detail = detail;
+    renderDetail();
+    $('#pair-result').innerHTML = '';
+    flash('success', `成对核准完成：申请 #${ids[0]}、#${ids[1]} 已通过，两条计划已同时更新`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.details && err.data.details.conflicts) {
+      renderPairResult({
+        adjustments: [],
+        conflicts: err.data.details.conflicts,
+        yearlyReport: err.data.details.yearlyReport,
+      }, { stale: true });
+      flash('error', '成对核准未通过核对，两份申请仍待审、计划与额度不变');
+      await refreshAfterChange();
+    } else {
+      flash('error', err.message);
+    }
+  }
+});
 
 // ---------- 实测 ----------
 async function loadMeasurementsTab() {

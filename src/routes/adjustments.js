@@ -11,9 +11,11 @@ const {
   getPendingAdjustment,
   decoratePlans,
   evaluateAdjustment,
+  evaluateAdjustmentPair,
   normalizeScheduleInput,
   serializeAdjustment,
   planNotStarted,
+  dateYmd,
 } = require('../service');
 const { exhibitDetail } = require('./exhibits');
 
@@ -353,6 +355,242 @@ router.post('/preview', requireRole('installer'), async (req, res, next) => {
         };
       });
     res.json({ preview: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 成对核准：同一展品两份待审调整申请同时替换原窗（互换/协同挪动档期）
+// 注意：必须注册在 '/:id/approve' 之前，否则 '/pair/approve' 会被 ':id' 捕获。
+// ---------------------------------------------------------------------------
+
+/** 解析请求体中的两个申请编号：adjustmentIds 数组、长度 2、互不相同。 */
+function parsePairIds(body) {
+  const ids = body && Array.isArray(body.adjustmentIds) ? body.adjustmentIds : null;
+  if (!ids || ids.length !== 2) {
+    throw new ValidationError('请提供两个不同的申请编号（adjustmentIds 数组，长度 2）');
+  }
+  const [a, b] = ids.map(Number);
+  if (!Number.isInteger(a) || !Number.isInteger(b)) {
+    throw new ValidationError('申请编号必须是整数');
+  }
+  if (a === b) throw new ValidationError('两个申请编号必须不同');
+  return [a, b];
+}
+
+/**
+ * 读取两份申请并做组成性校验：存在、不同计划、同一展品、均待审。
+ * q 为查询函数或事务 client。返回按输入顺序的 [adjA, adjB]。
+ */
+async function loadPairAdjustments(q, idA, idB) {
+  const run = typeof q === 'function' ? q : q.query.bind(q);
+  const { rows } = await run(
+    'SELECT * FROM plan_adjustments WHERE id IN ($1, $2)',
+    [idA, idB]
+  );
+  const byId = new Map(rows.map((r) => [Number(r.id), r]));
+  const adjA = byId.get(idA);
+  const adjB = byId.get(idB);
+  if (!adjA) throw new ValidationError(`调整申请 #${idA} 不存在`);
+  if (!adjB) throw new ValidationError(`调整申请 #${idB} 不存在`);
+  if (Number(adjA.plan_id) === Number(adjB.plan_id)) {
+    throw new ValidationError(
+      `申请 #${idA} 与 #${idB} 关联同一计划 #${adjA.plan_id}，成对核准须选择两条不同计划的申请`
+    );
+  }
+  if (Number(adjA.exhibit_id) !== Number(adjB.exhibit_id)) {
+    throw new ValidationError(
+      `申请 #${idA}（展品 #${adjA.exhibit_id}）与 #${idB}（展品 #${adjB.exhibit_id}）跨展品，` +
+        '成对核准仅限同一展品'
+    );
+  }
+  for (const adj of [adjA, adjB]) {
+    if (adj.status !== 'pending') {
+      throw new ValidationError(
+        `调整申请 #${adj.id} 已结案（当前状态：${adj.status}），不能参与成对核准`
+      );
+    }
+  }
+  return [adjA, adjB];
+}
+
+/** 计划当前值（原值）概要，供成对结果对照展示。 */
+function planOriginalValues(plan) {
+  return {
+    title: plan.title,
+    status: plan.status,
+    startDate: dateYmd(plan.start_date),
+    endDate: dateYmd(plan.end_date),
+    periods: plan.light_periods,
+    estimatedLux: Number(plan.estimated_lux),
+  };
+}
+
+/** 成对试算/核对的对外形态：两份申请（含原值）+ 核对结果 + 按年报告。 */
+function pairPayload(adjA, adjB, planA, planB, evalResult) {
+  return {
+    exhibitId: Number(adjA.exhibit_id),
+    adjustments: [
+      { ...serializeAdjustment(adjA), original: planOriginalValues(planA) },
+      { ...serializeAdjustment(adjB), original: planOriginalValues(planB) },
+    ],
+    ok: evalResult.ok,
+    conflicts: evalResult.conflicts,
+    items: evalResult.items,
+    yearlyReport: evalResult.yearlyReport,
+  };
+}
+
+/** 成对核对失败的中文原因列表（错误信息与页面共用）。 */
+function pairConflictMessages(evalResult, planA, planB) {
+  const c = evalResult.conflicts;
+  const parts = [];
+  const titleOf = (pid) => (Number(pid) === Number(planA.id) ? planA.title : planB.title);
+  for (const x of c.notApproved) {
+    parts.push(`计划「${titleOf(x.planId)}」(#${x.planId}) 已不是“已批准”状态（当前：${x.status}）`);
+  }
+  for (const x of c.notStarted) {
+    parts.push(`计划「${titleOf(x.planId)}」(#${x.planId}) 已经开始`);
+  }
+  for (const m of c.outsideMeasurements) {
+    parts.push(
+      `计划 #${m.planId} 的未作废实测 #${m.id}（${m.start} ~ ${m.end}，${m.status}）不在其新开灯窗内`
+    );
+  }
+  if (c.pairOverlap) parts.push('两份拟改开灯窗彼此重叠');
+  for (const p of c.overlappingPlans) {
+    parts.push(
+      `申请 #${p.adjustmentId} 的拟改窗与同展品` +
+        `${p.other.status === 'pending_review' ? '待复核' : '已批准'}` +
+        `计划「${p.other.title}」(#${p.other.id}) 开灯时间重叠`
+    );
+  }
+  for (const y of c.missingLimits) parts.push(`${y} 年尚未登记年度额度`);
+  for (const o of c.overflows) {
+    const contrib = o.contributions
+      .map((ct) => `计划 #${ct.planId} 贡献 ${ct.newResidue}`)
+      .join('，');
+    parts.push(
+      `${o.year} 年：上限 ${o.limit}，其他占用 ${o.usedByOthers}，` +
+        `两份拟改残余合计 ${o.newResidueTotal}（${contrib}），合计 ${o.projected}，超额 ${o.excess} lx·h`
+    );
+  }
+  return parts;
+}
+
+/**
+ * 成对试算（保管员）：两份待审申请同时替换原窗的核对，不写库。
+ * 组成性错误（同一计划/跨展品/已结案/编号无效）直接 400 并指出原因。
+ */
+router.post('/pair/preview', requireRole('conservator'), async (req, res, next) => {
+  try {
+    const [idA, idB] = parsePairIds(req.body || {});
+    const pre = await loadPairAdjustments(query, idA, idB);
+    const result = await withExhibitTransaction(pre[0].exhibit_id, async (client) => {
+      await lockExhibit(client, pre[0].exhibit_id);
+      // 锁内重读重核，避免预检后状态被并发修改
+      const [adjA, adjB] = await loadPairAdjustments(client, idA, idB);
+      const planA = await getPlan(client, adjA.plan_id);
+      const planB = await getPlan(client, adjB.plan_id);
+      const evalResult = await evaluateAdjustmentPair(client, planA, adjA, planB, adjB);
+      return pairPayload(adjA, adjB, planA, planB, evalResult);
+    });
+    res.json({ pairPreview: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * 成对核准（保管员）：展品锁事务内重新核对全部规则，
+ * 全部通过才原子更新两条计划、结案两份申请并记审计；
+ * 任一失败则事务回滚，两份申请仍待审、计划与额度不变。
+ */
+router.post('/pair/approve', requireRole('conservator'), async (req, res, next) => {
+  try {
+    const [idA, idB] = parsePairIds(req.body || {});
+    const pre = await loadPairAdjustments(query, idA, idB);
+    const exhibitId = pre[0].exhibit_id;
+
+    const detail = await withExhibitTransaction(exhibitId, async (client) => {
+      await lockExhibit(client, exhibitId);
+      // 锁内重新核对组成与状态（预检后可能被并发撤回/结案）
+      const [adjA, adjB] = await loadPairAdjustments(client, idA, idB);
+      const planA = await getPlan(client, adjA.plan_id);
+      const planB = await getPlan(client, adjB.plan_id);
+
+      const evalResult = await evaluateAdjustmentPair(client, planA, adjA, planB, adjB);
+      if (!evalResult.ok) {
+        // 核对失败：两份申请保持待审，事务回滚，计划与额度不变
+        throw new ConflictError(
+          `成对核准（申请 #${idA} + #${idB}）未通过核对：` +
+            pairConflictMessages(evalResult, planA, planB).join('；'),
+          {
+            adjustmentIds: [idA, idB],
+            conflicts: evalResult.conflicts,
+            items: evalResult.items,
+            yearlyReport: evalResult.yearlyReport,
+          }
+        );
+      }
+
+      // 全部通过：原子更新两条计划 + 结案两份申请 + 审计
+      const entries = [
+        { adj: adjA, plan: planA, otherAdj: adjB, otherPlan: planB, item: evalResult.items[0] },
+        { adj: adjB, plan: planB, otherAdj: adjA, otherPlan: planA, item: evalResult.items[1] },
+      ];
+      for (const { adj, plan, otherAdj, otherPlan, item } of entries) {
+        await client.query(
+          `UPDATE plans
+              SET start_date = $2, end_date = $3, light_periods = $4::jsonb,
+                  estimated_lux = $5, review_reason = NULL, updated_at = now()
+            WHERE id = $1`,
+          [plan.id, adj.start_date, adj.end_date, JSON.stringify(adj.light_periods), adj.estimated_lux]
+        );
+        await client.query(
+          `UPDATE plan_adjustments
+              SET status = 'approved', reviewed_by = $2, reviewed_at = now(), updated_at = now()
+            WHERE id = $1`,
+          [adj.id, req.sessionUser.userId]
+        );
+        await recordAudit(client, req.sessionUser, 'plan.adjustment.pair_approve',
+          'plan_adjustment', adj.id, {
+            planId: plan.id,
+            exhibitId: plan.exhibit_id,
+            pairWith: otherAdj.id,
+            pairPlanId: otherPlan.id,
+            oldResidueYearly: item.oldResidueYearly,
+            newResidueYearly: item.newResidueYearly,
+            oldValues: planOriginalValues(plan),
+            newValues: {
+              startDate: dateYmd(adj.start_date),
+              endDate: dateYmd(adj.end_date),
+              periods: adj.light_periods,
+              estimatedLux: Number(adj.estimated_lux),
+            },
+          });
+        await recordAudit(client, req.sessionUser, 'plan.update_via_adjustment', 'plan', plan.id, {
+          adjustmentId: adj.id,
+          pairWith: otherAdj.id,
+          oldResidueYearly: item.oldResidueYearly,
+          newResidueYearly: item.newResidueYearly,
+        });
+      }
+
+      const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
+      return {
+        ...detailAfter,
+        pairApproval: {
+          adjustmentIds: [idA, idB],
+          planIds: [planA.id, planB.id],
+          items: evalResult.items,
+          yearlyReport: evalResult.yearlyReport,
+        },
+      };
+    });
+
+    res.json(detail);
   } catch (err) {
     next(err);
   }
